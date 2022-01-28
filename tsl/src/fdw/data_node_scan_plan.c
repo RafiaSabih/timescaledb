@@ -40,6 +40,8 @@
 #include "data_node_scan_exec.h"
 #include "fdw_utils.h"
 
+#include "nodes/gapfill/planner.h"
+
 /*
  * DataNodeScan is a custom scan implementation for scanning hypertables on
  * remote data nodes instead of scanning individual remote chunks.
@@ -293,7 +295,11 @@ force_group_by_push_down(PlannerInfo *root, RelOptInfo *hyper_rel)
 {
 	PartitionScheme partscheme = hyper_rel->part_scheme;
 	List *groupexprs;
+	List **nullable_partexprs;
 	int16 new_partnatts;
+	Oid *partopfamily;
+	Oid *partopcintype;
+	Oid *partcollation;
 	ListCell *lc;
 	int i = 0;
 
@@ -302,10 +308,29 @@ force_group_by_push_down(PlannerInfo *root, RelOptInfo *hyper_rel)
 	groupexprs = get_sortgrouplist_exprs(root->parse->groupClause, root->parse->targetList);
 	new_partnatts = list_length(groupexprs);
 
-	/* Only reallocate the partitioning attributes array if it is smaller than
-	 * the new size */
+	/* Only reallocate the partitioning attributes arrays if it is smaller than
+	 * the new size. palloc0 is needed to zero out the extra space. */
 	if (partscheme->partnatts < new_partnatts)
+	{
+		partopfamily = palloc0(new_partnatts * sizeof(Oid));
+		partopcintype = palloc0(new_partnatts * sizeof(Oid));
+		partcollation = palloc0(new_partnatts * sizeof(Oid));
+		nullable_partexprs = palloc0(new_partnatts * sizeof(List *));
+
+		memcpy(partopfamily, partscheme->partopfamily, partscheme->partnatts * sizeof(Oid));
+		memcpy(partopcintype, partscheme->partopcintype, partscheme->partnatts * sizeof(Oid));
+		memcpy(partcollation, partscheme->partcollation, partscheme->partnatts * sizeof(Oid));
+		memcpy(nullable_partexprs,
+			   hyper_rel->nullable_partexprs,
+			   partscheme->partnatts * sizeof(List *));
+
+		partscheme->partopfamily = partopfamily;
+		partscheme->partopcintype = partopcintype;
+		partscheme->partcollation = partcollation;
+		hyper_rel->nullable_partexprs = nullable_partexprs;
+
 		hyper_rel->partexprs = (List **) palloc0(sizeof(List *) * new_partnatts);
+	}
 
 	partscheme->partnatts = new_partnatts;
 
@@ -404,6 +429,7 @@ data_node_scan_add_node_paths(PlannerInfo *root, RelOptInfo *hyper_rel)
 	int ndata_node_rels;
 	DataNodeChunkAssignments scas;
 	int i;
+	bool gapfill_safe;
 
 	Assert(NULL != ht);
 
@@ -426,8 +452,13 @@ data_node_scan_add_node_paths(PlannerInfo *root, RelOptInfo *hyper_rel)
 	/* Try to push down GROUP BY expressions and bucketing, if possible */
 	push_down_group_bys(root, hyper_rel, ht->space, &scas);
 
-	/* Create estimates and paths for each data node rel based on data node chunk
-	 * assignments */
+	/* Check if we can push down gapfill to data nodes */
+	gapfill_safe = pushdown_gapfill(root, hyper_rel, ht->space, &scas);
+
+	/*
+	 * Create estimates and paths for each data node rel based on data node chunk
+	 * assignments
+	 */
 	for (i = 0; i < ndata_node_rels; i++)
 	{
 		RelOptInfo *data_node_rel = data_node_rels[i];
@@ -435,8 +466,10 @@ data_node_scan_add_node_paths(PlannerInfo *root, RelOptInfo *hyper_rel)
 			data_node_chunk_assignment_get_or_create(&scas, data_node_rel);
 		TsFdwRelInfo *fpinfo;
 
-		/* Basic stats for data node rels come from the assigned chunks since
-		 * data node rels don't correspond to real tables in the system */
+		/*
+		 * Basic stats for data node rels come from the assigned chunks since
+		 * data node rels don't correspond to real tables in the system
+		 */
 		data_node_rel->pages = sca->pages;
 		data_node_rel->tuples = sca->tuples;
 		data_node_rel->rows = sca->rows;
@@ -447,9 +480,18 @@ data_node_scan_add_node_paths(PlannerInfo *root, RelOptInfo *hyper_rel)
 									data_node_rel,
 									data_node_rel->serverid,
 									hyper_rte->relid,
-									TS_FDW_RELINFO_HYPERTABLE_DATA_NODE);
+									TS_FDW_RELINFO_HYPERTABLE_DATA_NODE, gapfill_safe);
 
 		fpinfo->sca = sca;
+
+		/*
+		 * Since we can not always call pushdown_gapfill where scas are not available,
+		 * remember if gapfill is safe to be pushed down for this relation for later
+		 * uses e.g. in add_foreign_grouping_paths.
+		 */
+
+		if (gapfill_safe)
+			fpinfo->pushdown_gapfill = true;
 
 		if (!bms_is_empty(sca->chunk_relids))
 		{

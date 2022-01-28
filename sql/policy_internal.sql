@@ -33,6 +33,10 @@ DECLARE
   numchunks   INTEGER := 1;
 BEGIN
 
+  -- procedures with SET clause cannot execute transaction
+  -- control so we adjust search_path in procedure body
+  SET LOCAL search_path TO pg_catalog;
+
   SELECT format('%I.%I', schema_name, table_name) INTO htoid
   FROM _timescaledb_catalog.hypertable
   WHERE id = htid;
@@ -47,7 +51,7 @@ BEGIN
     SELECT
       show.oid, ch.schema_name, ch.table_name, ch.status
     FROM
-      show_chunks(htoid, older_than => lag) AS show(oid)
+      @extschema@.show_chunks(htoid, older_than => lag) AS show(oid)
       INNER JOIN pg_class pgc ON pgc.oid = show.oid
       INNER JOIN pg_namespace pgns ON pgc.relnamespace = pgns.oid
       INNER JOIN _timescaledb_catalog.chunk ch ON ch.table_name = pgc.relname AND ch.schema_name = pgns.nspname AND ch.hypertable_id = htid
@@ -56,13 +60,22 @@ BEGIN
       AND (ch.status = 0 OR ch.status = 3)
   LOOP
     IF chunk_rec.status = 0 THEN
-       PERFORM compress_chunk( chunk_rec.oid );
+       PERFORM @extschema@.compress_chunk( chunk_rec.oid );
     ELSIF chunk_rec.status = 3 AND recompress_enabled IS TRUE THEN
-       PERFORM decompress_chunk(chunk_rec.oid, if_compressed => true);
+       PERFORM @extschema@.decompress_chunk(chunk_rec.oid, if_compressed => true);
        COMMIT;
-       PERFORM compress_chunk(chunk_rec.oid);
+       -- SET LOCAL is only active until end of transaction.
+       -- While we could use SET at the start of the function we do not
+       -- want to bleed out search_path to caller, so we do SET LOCAL
+       -- again after COMMIT
+       PERFORM @extschema@.compress_chunk(chunk_rec.oid);
     END IF;
     COMMIT;
+    -- SET LOCAL is only active until end of transaction.
+    -- While we could use SET at the start of the function we do not
+    -- want to bleed out search_path to caller, so we do SET LOCAL
+    -- again after COMMIT
+    SET LOCAL search_path TO pg_catalog;
     IF verbose_log THEN
        RAISE LOG 'job % completed processing chunk %.%', job_id, chunk_rec.schema_name, chunk_rec.table_name;
     END IF;
@@ -90,6 +103,11 @@ DECLARE
   numchunks           INTEGER := 1;
   recompress_enabled  BOOL;
 BEGIN
+
+  -- procedures with SET clause cannot execute transaction
+  -- control so we adjust search_path in procedure body
+  SET LOCAL search_path TO pg_catalog;
+
   IF config IS NULL THEN
     RAISE EXCEPTION 'job % has null config', job_id;
   END IF;

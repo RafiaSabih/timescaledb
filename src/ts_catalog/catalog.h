@@ -22,7 +22,7 @@
  * The TimescaleDB catalog contains schema metadata for hypertables, among other
  * things. The metadata is stored in regular tables. This header file contains
  * definitions for those tables and should match any table declarations in
- * sql/common/tables.sql.
+ * sql/pre_install/tables.sql.
  *
  * A source file that includes this header has access to a catalog object,
  * which contains cached information about catalog tables, such as relation
@@ -884,7 +884,6 @@ typedef struct FormData_continuous_agg
 	 * procedures instead, such as:
 	 * - ts_continuous_agg_bucket_width_variable
 	 * - ts_continuous_agg_bucket_width
-	 * - ts_bucket_function_to_bucket_width_in_months
 	 */
 	int64 bucket_width;
 	NameData direct_view_schema;
@@ -1297,14 +1296,13 @@ typedef struct CatalogDatabaseInfo
 typedef struct Catalog
 {
 	CatalogTableInfo tables[_MAX_CATALOG_TABLES];
+	Oid extension_schema_id[_TS_MAX_SCHEMA];
 
-	Oid cache_schema_id;
 	struct
 	{
 		Oid inval_proxy_id;
 	} caches[_MAX_CACHE_TYPES];
 
-	Oid internal_schema_id;
 	struct
 	{
 		Oid function_id;
@@ -1326,6 +1324,7 @@ extern void ts_catalog_table_info_init(CatalogTableInfo *tables, int max_table,
 extern TSDLLEXPORT CatalogDatabaseInfo *ts_catalog_database_info_get(void);
 extern TSDLLEXPORT Catalog *ts_catalog_get(void);
 extern void ts_catalog_reset(void);
+extern bool ts_is_catalog_table(Oid relid);
 
 /* Functions should operate on a passed-in Catalog struct */
 static inline Oid

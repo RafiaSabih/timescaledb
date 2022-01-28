@@ -1,6 +1,6 @@
 # This section has to be equivalent to test/postgresql.conf
 shared_preload_libraries=timescaledb
-max_worker_processes=16
+max_worker_processes=24
 autovacuum=false
 random_page_cost=1.0
 timescaledb.telemetry_level=off
@@ -27,3 +27,4 @@ ssl_key_file='@TEST_OUTPUT_DIR@/ts_data_node.key'
 timescaledb.ssl_dir='@TEST_OUTPUT_DIR@/timescaledb/certs'
 timescaledb.passfile='@TEST_PASSFILE@'
 wal_level='logical'
+timescaledb_experimental.enable_distributed_ddl=on

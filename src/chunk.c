@@ -1093,7 +1093,8 @@ chunk_create_table_constraints(const Chunk *chunk)
 		ts_chunk_index_create_all(chunk->fd.hypertable_id,
 								  chunk->hypertable_relid,
 								  chunk->fd.id,
-								  chunk->table_id);
+								  chunk->table_id,
+								  InvalidOid);
 	}
 }
 
@@ -2612,6 +2613,26 @@ ts_chunk_get_by_relid(Oid relid, bool fail_if_not_found)
 	return chunk_get_by_name(schema, table, fail_if_not_found);
 }
 
+void
+ts_chunk_free(Chunk *chunk)
+{
+	if (chunk->cube)
+	{
+		ts_hypercube_free(chunk->cube);
+	}
+
+	if (chunk->constraints)
+	{
+		ChunkConstraints *c = chunk->constraints;
+		pfree(c->constraints);
+		pfree(c);
+	}
+
+	list_free(chunk->data_nodes);
+
+	pfree(chunk);
+}
+
 static const char *
 DatumGetInt32AsString(Datum datum)
 {
@@ -3010,6 +3031,7 @@ chunk_tuple_delete(TupleInfo *ti, DropBehavior behavior, bool preserve_chunk_cat
 
 		form.compressed_chunk_id = INVALID_CHUNK_ID;
 		form.dropped = true;
+		form.status = CHUNK_STATUS_DEFAULT;
 		new_tuple = chunk_formdata_make_tuple(&form, ts_scanner_get_tupledesc(ti));
 		ts_catalog_update_tid(ti->scanrel, ts_scanner_get_tuple_tid(ti), new_tuple);
 		heap_freetuple(new_tuple);

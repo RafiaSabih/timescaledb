@@ -76,6 +76,7 @@
 #include "remote/dist_commands.h"
 #include "ts_catalog/hypertable_data_node.h"
 #include "deparse.h"
+#include "timezones.h"
 
 #define FINALFN "finalize_agg"
 #define PARTIALFN "partialize_agg"
@@ -180,6 +181,13 @@ typedef struct CAggTimebucketInfo
 	int64 bucket_width;			  /* bucket_width of time_bucket, stores BUCKET_WIDHT_VARIABLE for
 									 variable-sized buckets */
 	Interval *interval;			  /* stores the interval, NULL if not specified */
+	const char *timezone;		  /* the name of the timezone, NULL if not specified */
+
+	/*
+	 * Custom origin value stored as UTC timestamp.
+	 * If not specified, stores infinity.
+	 */
+	Timestamp origin;
 } CAggTimebucketInfo;
 
 typedef struct AggPartCxt
@@ -214,7 +222,7 @@ static void finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query,
 							   MatTableColumnInfo *mattblinfo);
 static Query *finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
 											 ObjectAddress *mattbladdress);
-static bool is_valid_bucketing_function(Oid funcid);
+static bool function_allowed_in_cagg_definition(Oid funcid);
 
 static Const *cagg_boundary_make_lower_bound(Oid type);
 static Oid cagg_get_boundary_converter_funcoid(Oid typoid);
@@ -299,7 +307,7 @@ create_bucket_function_catalog_entry(int32 matht_id, bool experimental, const ch
 	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_origin)] =
 		CStringGetTextDatum(origin);
 	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_timezone)] =
-		CStringGetTextDatum(timezone);
+		CStringGetTextDatum(timezone ? timezone : "");
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	ts_catalog_insert_values(rel, desc, values, nulls);
@@ -671,8 +679,10 @@ caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id, Oid hypert
 	src->htpartcolno = hypertable_partition_colno;
 	src->htpartcoltype = hypertable_partition_coltype;
 	src->htpartcol_interval_len = hypertable_partition_col_interval;
-	src->bucket_width = 0; /* invalid value */
-	src->interval = NULL;  /* not specified by default */
+	src->bucket_width = 0;			/* invalid value */
+	src->interval = NULL;			/* not specified by default */
+	src->timezone = NULL;			/* not specified by default */
+	TIMESTAMP_NOBEGIN(src->origin); /* origin is not specified by default */
 }
 
 /*
@@ -686,11 +696,10 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 	ListCell *l;
 	bool found = false;
 
-	/*
-	 * Make sure bucket_width was initialized by caggtimebucketinfo_init().
-	 * This assumption is used below.
-	 */
+	/* Make sure tbinfo was initialized. This assumption is used below. */
 	Assert(tbinfo->bucket_width == 0);
+	Assert(tbinfo->timezone == NULL);
+	Assert(TIMESTAMP_NOT_FINITE(tbinfo->origin));
 
 	foreach (l, groupClause)
 	{
@@ -701,8 +710,9 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 			FuncExpr *fe = ((FuncExpr *) tle->expr);
 			Node *width_arg;
 			Node *col_arg;
+			Node *tz_arg;
 
-			if (!is_valid_bucketing_function(fe->funcid))
+			if (!function_allowed_in_cagg_definition(fe->funcid))
 				continue;
 
 			if (found)
@@ -721,6 +731,111 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg(
 							 "time bucket function must reference a hypertable dimension column")));
+
+			if (list_length(fe->args) == 4)
+			{
+				/*
+				 * Timezone and custom origin are specified. In this clause we
+				 * save only the timezone. Origin is processed in the following
+				 * clause.
+				 */
+				tz_arg = eval_const_expressions(NULL, lfourth(fe->args));
+
+				if (!IsA(tz_arg, Const))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("only immutable expressions allowed in time bucket function"),
+							 errhint("Use an immutable expression as fourth argument"
+									 " to the time bucket function.")));
+
+				Const *tz = castNode(Const, tz_arg);
+
+				/* This is assured by function_allowed_in_cagg_definition() above. */
+				Assert(tz->consttype == TEXTOID);
+				const char *tz_name = TextDatumGetCString(tz->constvalue);
+				if (!ts_is_valid_timezone_name(tz_name))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid timezone name \"%s\"", tz_name)));
+				}
+
+				tbinfo->timezone = tz_name;
+				tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+			}
+
+			if (list_length(fe->args) >= 3)
+			{
+				tz_arg = eval_const_expressions(NULL, lthird(fe->args));
+				if (!IsA(tz_arg, Const))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("only immutable expressions allowed in time bucket function"),
+							 errhint("Use an immutable expression as third argument"
+									 " to the time bucket function.")));
+
+				Const *tz = castNode(Const, tz_arg);
+				if ((tz->consttype == TEXTOID) && (list_length(fe->args) == 3))
+				{
+					/* Timezone specified */
+					const char *tz_name = TextDatumGetCString(tz->constvalue);
+
+					if (!ts_is_valid_timezone_name(tz_name))
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid timezone name \"%s\"", tz_name)));
+					}
+
+					tbinfo->timezone = tz_name;
+					tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+				}
+				else
+				{
+					/*
+					 * Custom origin specified. This is always treated as
+					 * a variable-sized bucket case.
+					 */
+					tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+
+					if (tz->constisnull)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid origin value: null")));
+					}
+
+					switch (tz->consttype)
+					{
+						case DATEOID:
+							tbinfo->origin = DatumGetTimestamp(
+								DirectFunctionCall1(date_timestamp, tz->constvalue));
+							break;
+						case TIMESTAMPOID:
+							tbinfo->origin = DatumGetTimestamp(tz->constvalue);
+							break;
+						case TIMESTAMPTZOID:
+							tbinfo->origin = DatumGetTimestampTz(tz->constvalue);
+							break;
+						default:
+							/*
+							 * This shouldn't happen. But if somehow it does
+							 * make sure the execution will stop here even in
+							 * the Release build.
+							 */
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("unsupported time bucket function")));
+					}
+
+					if (TIMESTAMP_NOT_FINITE(tbinfo->origin))
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid origin value: infinity")));
+					}
+				}
+			}
 
 			/*
 			 * We constify width expression here so any immutable expression will be allowed
@@ -752,6 +867,37 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 						 errmsg("only immutable expressions allowed in time bucket function"),
 						 errhint("Use an immutable expression as first argument"
 								 " to the time bucket function.")));
+
+			if ((tbinfo->bucket_width == BUCKET_WIDTH_VARIABLE) && (tbinfo->interval->month != 0))
+			{
+				/* Monthly buckets case */
+				if (!TIMESTAMP_NOT_FINITE(tbinfo->origin))
+				{
+					/*
+					 * Origin was specified - make sure it's the first day of the month.
+					 * If a timezone was specified the check should be done in this timezone.
+					 */
+					Timestamp origin = tbinfo->origin;
+					if (tbinfo->timezone != NULL)
+					{
+						/* The code is equal to 'timestamptz AT TIME ZONE tzname'. */
+						origin = DatumGetTimestamp(
+							DirectFunctionCall2(timestamptz_zone,
+												CStringGetTextDatum(tbinfo->timezone),
+												TimestampTzGetDatum((TimestampTz) origin)));
+					}
+
+					const char *day =
+						TextDatumGetCString(DirectFunctionCall2(timestamp_to_char,
+																TimestampGetDatum(origin),
+																CStringGetTextDatum("DD")));
+					if (strcmp(day, "01") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("for monthly buckets origin must be the first day of the "
+										"month")));
+				}
+			}
 		}
 	}
 
@@ -1276,20 +1422,13 @@ get_partialize_funcexpr(Aggref *agg)
  * for continuous aggregates.
  */
 static bool
-is_valid_bucketing_function(Oid funcid)
+function_allowed_in_cagg_definition(Oid funcid)
 {
-	bool is_timescale;
 	FuncInfo *finfo = ts_func_cache_get_bucketing_func(funcid);
-
 	if (finfo == NULL)
-	{
 		return false;
-	}
 
-	is_timescale =
-		(finfo->origin == ORIGIN_TIMESCALE) || (finfo->origin == ORIGIN_TIMESCALE_EXPERIMENTAL);
-
-	return is_timescale && (finfo->nargs == 2);
+	return finfo->allowed_in_cagg_definition;
 }
 
 /*initialize MatTableColumnInfo */
@@ -1354,7 +1493,7 @@ mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input, int original_q
 			bool timebkt_chk = false;
 
 			if (IsA(tle->expr, FuncExpr))
-				timebkt_chk = is_valid_bucketing_function(((FuncExpr *) tle->expr)->funcid);
+				timebkt_chk = function_allowed_in_cagg_definition(((FuncExpr *) tle->expr)->funcid);
 
 			if (tle->resname)
 				colname = pstrdup(tle->resname);
@@ -1945,6 +2084,7 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	if (origquery_ht->bucket_width == BUCKET_WIDTH_VARIABLE)
 	{
 		const char *bucket_width;
+		const char *origin = "";
 
 		/*
 		 * Variable-sized buckets work only with intervals.
@@ -1952,6 +2092,12 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 		Assert(origquery_ht->interval != NULL);
 		bucket_width = DatumGetCString(
 			DirectFunctionCall1(interval_out, IntervalPGetDatum(origquery_ht->interval)));
+
+		if (!TIMESTAMP_NOT_FINITE(origquery_ht->origin))
+		{
+			origin = DatumGetCString(
+				DirectFunctionCall1(timestamp_out, TimestampGetDatum(origquery_ht->origin)));
+		}
 
 		/*
 		 * `experimental` = true and `name` = "time_bucket_ng" are hardcoded
@@ -1967,8 +2113,8 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 											 true,
 											 "time_bucket_ng",
 											 bucket_width,
-											 "",
-											 "");
+											 origin,
+											 origquery_ht->timezone);
 	}
 
 	/* Step 5 create trigger on raw hypertable -specified in the user view query*/
@@ -2051,9 +2197,9 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 		 * instead of minimum date we use -infinity since time_bucket(-infinity)
 		 * is well-defined as -infinity.
 		 *
-		 * For more details see refresh.c, particularly:
-		 * - compute_inscribed_bucketed_refresh_window_for_months()
-		 * - compute_circumscribed_bucketed_refresh_window_for_months()
+		 * For more details see:
+		 * - ts_compute_inscribed_bucketed_refresh_window_variable()
+		 * - ts_compute_circumscribed_bucketed_refresh_window_variable()
 		 */
 		refresh_window.start = ts_continuous_agg_bucket_width_variable(cagg) ?
 								   ts_time_get_nobegin(refresh_window.type) :

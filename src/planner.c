@@ -523,6 +523,7 @@ classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **p
 					reltype = TS_REL_CHUNK;
 					ht = get_hypertable(chunk->hypertable_relid, CACHE_FLAG_NONE);
 					Assert(ht != NULL);
+					ts_chunk_free(chunk);
 				}
 			}
 			break;
@@ -708,7 +709,10 @@ reenable_inheritance(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntr
 			 */
 			if (in_rel->reloptkind == RELOPT_BASEREL ||
 				in_rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+			{
+				Assert(in_rte->relkind == RELKIND_RELATION);
 				ts_set_rel_size(root, in_rel, i, in_rte);
+			}
 
 			/* if we're activating inheritance during a hypertable's pathlist
 			 * creation then we're past the point at which postgres will add

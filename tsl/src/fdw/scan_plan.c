@@ -905,6 +905,9 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo 
 	fpinfo->sca = ifpinfo->sca;
 	merge_fdw_options(fpinfo, ifpinfo, NULL);
 
+	if (ifpinfo->pushdown_gapfill)
+		fpinfo->pushdown_gapfill = true;
+
 	/*
 	 * Assess if it is safe to push down aggregation and grouping.
 	 *
@@ -923,6 +926,20 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo 
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
 
+	if (ifpinfo->pushdown_gapfill)
+	{
+		/*
+		 * If pushdown of gapfill is possible then also check if it would
+		 * be beneficial to actually push it down. Since, it can create
+		 * more tuples and they need to be transferred to the data node.
+		 * However, still pushing of gapfill to the data nodes could make
+		 * sense because aggreagting over it could be then done at the data
+		 * nodes itself, hence ignore pushing down gapfill to data nodes
+		 * when it produces a "really" larger amount of tuples.
+		 */
+		if (10 * ifpinfo->rows > fpinfo->rows)
+			fpinfo->pushdown_gapfill = false;
+	}
 	/* Create and add path to the grouping relation. */
 	grouppath = (Path *) create_path(root,
 									 grouped_rel,
@@ -949,6 +966,8 @@ fdw_create_upper_paths(TsFdwRelInfo *input_fpinfo, PlannerInfo *root, UpperRelat
 {
 	Assert(input_fpinfo != NULL);
 
+	TsFdwRelInfo *output_fpinfo = NULL;
+
 	/*
 	 * If input rel is not safe to pushdown, then simply return as we cannot
 	 * perform any post-join operations on the data node.
@@ -965,8 +984,9 @@ fdw_create_upper_paths(TsFdwRelInfo *input_fpinfo, PlannerInfo *root, UpperRelat
 	{
 		case UPPERREL_GROUP_AGG:
 		case UPPERREL_PARTIAL_GROUP_AGG:
-			input_fpinfo = fdw_relinfo_alloc(output_rel, input_fpinfo->type);
-			input_fpinfo->pushdown_safe = false;
+			output_fpinfo = fdw_relinfo_alloc_or_get(output_rel);
+			output_fpinfo->type = input_fpinfo->type;
+			output_fpinfo->pushdown_safe = false;
 			add_foreign_grouping_paths(root,
 									   input_rel,
 									   output_rel,

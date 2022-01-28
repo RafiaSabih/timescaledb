@@ -243,8 +243,8 @@ NOTICE:  chunk "_hyper_11_2_chunk" is already compressed
 select compress_chunk(ch1.schema_name|| '.' || ch1.table_name)
 FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht where ch1.hypertable_id = ht.id and ht.table_name like 'non_compressed' ORDER BY ch1.id limit 1;
 ERROR:  compression not enabled on "non_compressed"
-DETAIL:  It is not possible to compress chunks on a hypertable that does not have compression enabled.
-HINT:  Enable compression using ALTER TABLE with the timescaledb.compress option.
+DETAIL:  It is not possible to compress chunks on a hypertable or continuous aggregate that does not have compression enabled.
+HINT:  Enable compression using ALTER TABLE/MATERIALIZED VIEW with the timescaledb.compress option.
 ALTER TABLE foo set (timescaledb.compress, timescaledb.compress_orderby = 'a', timescaledb.compress_segmentby = 'c');
 ERROR:  cannot change configuration on already compressed chunks
 DETAIL:  There are compressed chunks that prevent changing the existing compression configuration.
@@ -458,7 +458,7 @@ SELECT config FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
 --should fail
 CALL run_job(:compressjob_id);
 ERROR:  job 1000 config must have compress_after
-CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 30 at RAISE
+CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 35 at RAISE
 SELECT remove_compression_policy('test_table_int');
  remove_compression_policy 
 ---------------------------
@@ -480,7 +480,7 @@ SELECT config FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
 --should fail
 CALL run_job(:compressjob_id);
 ERROR:  job 1001 config must have hypertable_id
-CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 21 at RAISE
+CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 26 at RAISE
 UPDATE _timescaledb_config.bgw_job
 SET config = NULL
 WHERE id = :compressjob_id;
@@ -493,26 +493,4 @@ SELECT config FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
 --should fail
 CALL run_job(:compressjob_id);
 ERROR:  job 1001 has null config
-CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 16 at RAISE
--- Create a hypertable and add a rogue inherited table to it. 
-CREATE TABLE i165 (time timestamptz PRIMARY KEY);
-SELECT create_hypertable('i165','time');
- create_hypertable  
---------------------
- (23,public,i165,t)
-(1 row)
-
-ALTER TABLE i165 SET (timescaledb.compress);
-SELECT compress_chunk(show_chunks('i165'));
- compress_chunk 
-----------------
-(0 rows)
-
-CREATE TABLE extras (more_magic bool) INHERITS (i165);
-INSERT INTO i165 (time) VALUES
-       (generate_series(TIMESTAMP '2019-08-01', TIMESTAMP '2019-08-10', INTERVAL '10 minutes'));
-\set VERBOSITY default
-SELECT * FROM i165;
-ERROR:  chunk not found
-DETAIL:  schema_name: public, table_name: extras
-\set VERBOSITY terse
+CONTEXT:  PL/pgSQL function _timescaledb_internal.policy_compression(integer,jsonb) line 21 at RAISE

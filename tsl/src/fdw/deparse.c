@@ -69,6 +69,7 @@
 #include <utils/typcache.h>
 
 #include <func_cache.h>
+#include <hypertable_cache.h>
 #include <remote/utils.h>
 
 #include "relinfo.h"
@@ -408,9 +409,10 @@ is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 		return false;
 
 	/*
-	 * It is not supported to execute time_bucket_gapfill on data node.
+	 * It is supported to push time_bucket_gapfill on data nodes for
+	 * a limited number of cases.
 	 */
-	if (gapfill_in_expression(expr))
+	if (!fpinfo->pushdown_gapfill)
 		return false;
 
 	/*

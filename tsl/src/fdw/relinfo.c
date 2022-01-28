@@ -33,6 +33,7 @@
 #include "relinfo.h"
 #include "remote/connection.h"
 #include "scan_exec.h"
+#include "planner.h"
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST 100.0
@@ -85,46 +86,33 @@ apply_fdw_and_server_options(TsFdwRelInfo *fpinfo)
 TsFdwRelInfo *
 fdw_relinfo_get(RelOptInfo *rel)
 {
-	TimescaleDBPrivate *rel_private;
+	TimescaleDBPrivate *rel_private = rel->fdw_private;
+	TsFdwRelInfo *fdw_relation_info = rel_private->fdw_relation_info;
 
-	if (!rel->fdw_private)
-		ts_create_private_reloptinfo(rel);
+	/*
+	 * This function is expected to return either null or a fully initialized
+	 * fdw_relation_info struct.
+	 */
+	Assert(!fdw_relation_info || fdw_relation_info->type != TS_FDW_RELINFO_UNINITIALIZED);
 
-	rel_private = rel->fdw_private;
-
-	if (!rel_private->fdw_relation_info)
-		rel_private->fdw_relation_info = palloc0(sizeof(TsFdwRelInfo));
-
-	return (TsFdwRelInfo *) rel_private->fdw_relation_info;
+	return fdw_relation_info;
 }
 
 TsFdwRelInfo *
-fdw_relinfo_alloc(RelOptInfo *rel, TsFdwRelInfoType reltype)
+fdw_relinfo_alloc_or_get(RelOptInfo *rel)
 {
-	TimescaleDBPrivate *rel_private;
-	TsFdwRelInfo *fpinfo;
+	TimescaleDBPrivate *rel_private = rel->fdw_private;
+	if (rel_private == NULL)
+	{
+		rel_private = ts_create_private_reloptinfo(rel);
+	}
 
-	if (NULL == rel->fdw_private)
-		ts_create_private_reloptinfo(rel);
+	if (rel_private->fdw_relation_info == NULL)
+	{
+		rel_private->fdw_relation_info = (TsFdwRelInfo *) palloc0(sizeof(TsFdwRelInfo));
+	}
 
-	rel_private = rel->fdw_private;
-
-	fpinfo = (TsFdwRelInfo *) palloc0(sizeof(*fpinfo));
-	rel_private->fdw_relation_info = (void *) fpinfo;
-	fpinfo->type = reltype;
-
-	return fpinfo;
-}
-
-static char *
-get_relation_qualified_name(Oid relid)
-{
-	StringInfo name = makeStringInfo();
-	const char *relname = get_rel_name(relid);
-	const char *namespace = get_namespace_name(get_rel_namespace(relid));
-	appendStringInfo(name, "%s.%s", quote_identifier(namespace), quote_identifier(relname));
-
-	return name->data;
+	return rel_private->fdw_relation_info;
 }
 
 static const double FILL_FACTOR_CURRENT_CHUNK = 0.5;
@@ -275,20 +263,6 @@ estimate_tuples_and_pages_using_shared_buffers(PlannerInfo *root, Hypertable *ht
 static void
 estimate_chunk_size(PlannerInfo *root, RelOptInfo *chunk_rel)
 {
-	/*
-	 * In any case, cache the chunk info for this chunk.
-	 *
-	 * Ideally, we would look up the chunks in a centralized manner in
-	 * ts_plan_expand_hypertable(), but that code path is not used by UPDATES
-	 * which use expand_inherited_rtentry() instead. For now, do this lookup
-	 * here where we need the chunk, to avoid complicating things. After we have
-	 * chunk exclusion for UPDATEs, we can revisit this.
-	 */
-	RangeTblEntry *chunk_rte = planner_rt_fetch(chunk_rel->relid, root);
-	TsFdwRelInfo *chunk_private = fdw_relinfo_get(chunk_rel);
-	Assert(!chunk_private->chunk);
-	chunk_private->chunk = ts_chunk_get_by_relid(chunk_rte->relid, true /* fail_if_not_found */);
-
 	const int parent_relid = bms_next_member(chunk_rel->top_parent_relids, -1);
 	if (parent_relid < 0)
 	{
@@ -307,8 +281,27 @@ estimate_chunk_size(PlannerInfo *root, RelOptInfo *chunk_rel)
 		return;
 	}
 
+	/*
+	 * Check if we have the chunk info cached for this chunk relation. For
+	 * SELECTs, we should have cached it when we performed chunk exclusion.
+	 * The UPDATEs use a completely different code path that doesn't do chunk
+	 * exclusion, so we'll have to look up this info now.
+	 */
+	TimescaleDBPrivate *chunk_private = ts_get_private_reloptinfo(chunk_rel);
+	if (chunk_private->chunk == NULL)
+	{
+		RangeTblEntry *chunk_rte = planner_rt_fetch(chunk_rel->relid, root);
+		chunk_private->chunk =
+			ts_chunk_get_by_relid(chunk_rte->relid, true /* fail_if_not_found */);
+	}
+
 	RelOptInfo *parent_info = root->simple_rel_array[parent_relid];
-	TsFdwRelInfo *parent_private = fdw_relinfo_get(parent_info);
+	/*
+	 * The parent FdwRelInfo might not be allocated and initialized here, because
+	 * it happens later in tsl_set_pathlist callback. We don't care about this
+	 * because we only need it for chunk size estimates, so allocate it ourselves.
+	 */
+	TsFdwRelInfo *parent_private = fdw_relinfo_alloc_or_get(parent_info);
 	RangeTblEntry *parent_rte = planner_rt_fetch(parent_relid, root);
 	Cache *hcache = ts_hypertable_cache_pin();
 	Hypertable *ht = ts_hypertable_cache_get_entry(hcache, parent_rte->relid, CACHE_FLAG_NONE);
@@ -380,7 +373,7 @@ estimate_chunk_size(PlannerInfo *root, RelOptInfo *chunk_rel)
 
 TsFdwRelInfo *
 fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local_table_id,
-				   TsFdwRelInfoType type)
+				   TsFdwRelInfoType type, bool gapfill_safe)
 {
 	TsFdwRelInfo *fpinfo;
 	ListCell *lc;
@@ -389,9 +382,13 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 
 	/*
 	 * We use TsFdwRelInfo to pass various information to subsequent
-	 * functions.
+	 * functions. It might be already partially initialized for a data node
+	 * hypertable, because we use it to maintain the chunk size estimates when
+	 * planning.
 	 */
-	fpinfo = fdw_relinfo_alloc(rel, type);
+	fpinfo = fdw_relinfo_alloc_or_get(rel);
+	Assert(fpinfo->type == TS_FDW_RELINFO_UNINITIALIZED || fpinfo->type == type);
+	fpinfo->type = type;
 
 	/*
 	 * Set the name of relation in fpinfo, while we are constructing it here.
@@ -402,7 +399,10 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 
 	fpinfo->relation_name = makeStringInfo();
 	refname = rte->eref->aliasname;
-	appendStringInfoString(fpinfo->relation_name, get_relation_qualified_name(rte->relid));
+	appendStringInfo(fpinfo->relation_name,
+					 "%s.%s",
+					 quote_identifier(get_namespace_name(get_rel_namespace(rte->relid))),
+					 quote_identifier(get_rel_name(rte->relid)));
 	if (*refname && strcmp(refname, get_rel_name(rte->relid)) != 0)
 		appendStringInfo(fpinfo->relation_name, " %s", quote_identifier(rte->eref->aliasname));
 
@@ -416,6 +416,7 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
 
+	fpinfo->pushdown_gapfill = gapfill_safe;
 	/* Look up foreign-table catalog info. */
 	fpinfo->server = GetForeignServer(server_oid);
 
