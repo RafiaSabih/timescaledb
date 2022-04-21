@@ -54,3 +54,45 @@ CREATE OR REPLACE FUNCTION @extschema@.remove_continuous_aggregate_policy(contin
 RETURNS VOID
 AS '@MODULE_PATHNAME@', 'ts_policy_refresh_cagg_remove'
 LANGUAGE C VOLATILE STRICT;
+
+/* 1 step policies */
+CREATE OR REPLACE FUNCTION @extschema@.add_policies(
+    relation REGCLASS,
+    if_not_exists BOOL = false,
+    refresh_start_offset "any" = NULL,
+    refresh_end_offset "any" = NULL,
+    refresh_schedule_interval INTERVAL = NULL,
+    compress_after "any" = NULL,
+    drop_after "any" = NULL)
+RETURNS TEXT[]
+AS '@MODULE_PATHNAME@', 'ts_policies_add'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE OR REPLACE FUNCTION @extschema@.remove_policies(
+    relation REGCLASS,
+    if_not_exists BOOL = false,
+    policy_names TEXT[] = NULL)
+RETURNS BOOL
+AS '@MODULE_PATHNAME@', 'ts_policies_remove'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE OR REPLACE FUNCTION @extschema@.alter_policies(
+    relation REGCLASS,
+    if_not_exists BOOL = false,
+    refresh_start_offset "any" = NULL,
+    refresh_end_offset "any" = NULL,
+    refresh_schedule_interval INTERVAL = NULL,
+    compress_after "any" = NULL,
+    drop_after "any" = NULL)
+RETURNS BOOL
+AS '@MODULE_PATHNAME@', 'ts_policies_alter'
+LANGUAGE C VOLATILE STRICT;
+
+-- Returns tuples of [policy name, json config] if JSON already contains the name, we don't need RECORD
+-- copy c-code of show_chunks Datum ts_chunk_show_chunks(PG_FUNCTION_ARGS) in /src/chunk.c
+-- also see ts_test_job_refresh(PG_FUNCTION_ARGS) in test_job_refresh.c
+
+CREATE OR REPLACE FUNCTION @extschema@.show_policies(continuous_aggregate REGCLASS, if_not_exists BOOL = false)
+RETURNS SETOF RECORD
+AS '@MODULE_PATHNAME@', 'ts_policies_show'
+LANGUAGE C  VOLATILE STRICT;
